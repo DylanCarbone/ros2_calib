@@ -1265,7 +1265,7 @@ class MainWindow(QMainWindow):
             self, "Save Target Transform", "", "Text Files (*.txt);;All Files (*)"
         )
         if file_path:
-            with open(file_path, "w") as f:
+            with open(file_path, "w", encoding="utf-8") as f:
                 f.write(self.final_transform_display.toPlainText())
 
     def dragEnterEvent(self, event: QDragEnterEvent):
