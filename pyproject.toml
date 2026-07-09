@@ -31,7 +31,8 @@ dependencies = [
     "NodeGraphQt",
     "transforms3d",
     "setuptools",
-    "open3d"
+    "open3d",
+    "laspy[laszip]"
 ]
 
 [project.urls]

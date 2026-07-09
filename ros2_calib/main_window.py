@@ -57,6 +57,7 @@ from .bag_handler import (
 )
 from .calibration_widget import CalibrationWidget
 from .common import UIStyles
+from .folder_loader import find_missing_files, load_calibration_folder
 from .frame_selection_widget import FrameSelectionWidget
 from .lidar2lidar_o3d_widget import launch_lidar2lidar_calibration
 from .tf_graph_widget import TFGraphWidget
@@ -194,6 +195,7 @@ class MainWindow(QMainWindow):
         self.proceed_button.setText(
             "Proceed to Frame Selection" if is_lidar_cam else "Proceed to Transform Selection"
         )
+        self.load_folder_button.setVisible(is_lidar_cam)
 
     def setup_load_view(self):
         self.load_widget = QWidget()
@@ -206,6 +208,13 @@ class MainWindow(QMainWindow):
         self.ros_version_combo = QComboBox()
         self.ros_version_combo.addItems(["JAZZY", "HUMBLE"])
         load_section_layout.addWidget(self.ros_version_combo)
+        self.load_folder_button = QPushButton("Load Calibration Folder")
+        self.load_folder_button.setToolTip(
+            "Load a folder containing scene_scan.laz, scene_image.jpg "
+            "and scene_intrinsics_extrinsics.npz"
+        )
+        self.load_folder_button.clicked.connect(self.load_calibration_folder_dialog)
+        load_section_layout.addWidget(self.load_folder_button)
         drag_drop_label = QLabel("or Drag & Drop")
         drag_drop_label.setStyleSheet("color: #666; font-style: italic;")
         load_section_layout.addWidget(drag_drop_label)
@@ -413,6 +422,52 @@ class MainWindow(QMainWindow):
         if file_path:
             self.load_bag_from_path(file_path)
 
+    def load_calibration_folder_dialog(self):
+        folder_path = QFileDialog.getExistingDirectory(self, "Open Calibration Folder")
+        if folder_path:
+            self.load_calibration_folder_from_path(folder_path)
+
+    def load_calibration_folder_from_path(self, folder_path):
+        """Load a folder containing scene_scan.laz, scene_image.jpg and
+        scene_intrinsics_extrinsics.npz directly into the LiDAR2Cam calibration flow,
+        bypassing rosbag topic selection and frame synchronization."""
+        if self.calibration_type != "LiDAR2Cam":
+            self.bag_path_label.setText(
+                "Error: Calibration folder loading only supports LiDAR ↔ Camera calibration."
+            )
+            self.bag_path_label.setStyleSheet("padding: 5px; border: 1px solid red;")
+            return
+        try:
+            data = load_calibration_folder(folder_path)
+        except Exception as e:
+            self.bag_path_label.setText(f"Error loading calibration folder: {str(e)}")
+            self.bag_path_label.setStyleSheet("padding: 5px; border: 1px solid red;")
+            return
+
+        self.bag_file = None
+        self.bag_path_label.setText(folder_path)
+        self.bag_path_label.setStyleSheet("padding: 5px; border: 1px solid gray;")
+        self.topics = []
+        self.topic_list_widget.clear()
+
+        self.lidar_frame = data["lidar_frame"]
+        self.camera_frame = data["camera_frame"]
+        self.tf_messages = {}
+
+        self.selected_topics = {
+            "image_topic": data["image_topic"],
+            "pointcloud_topic": data["pointcloud_topic"],
+            "camerainfo_topic": data["camerainfo_topic"],
+            "topic_types": data["topic_types"],
+            "raw_messages": data["raw_messages"],
+            "tf_messages": data["tf_messages"],
+        }
+        self.tf_title_label.setText(
+            f"Select Initial Transformation: {self.lidar_frame} → {self.camera_frame}"
+        )
+        self.load_tf_topics_in_transform_view()
+        self.stacked_widget.setCurrentIndex(2)  # Switch to Transform View
+
     def find_yaml_file(self, mcap_path):
         directory = os.path.dirname(mcap_path)
         mcap_basename = os.path.splitext(os.path.basename(mcap_path))[0]
@@ -435,11 +490,17 @@ class MainWindow(QMainWindow):
                     "Error: Corresponding metadata.yaml or matching .yaml not found."
                 )
         elif os.path.isdir(path):
+            if not find_missing_files(path):
+                self.load_calibration_folder_from_path(path)
+                return
             mcap_files = [f for f in os.listdir(path) if f.endswith(".mcap")]
             if len(mcap_files) == 1:
                 self.process_dropped_path(os.path.join(path, mcap_files[0]))
             elif not mcap_files:
-                self.bag_path_label.setText("Error: No .mcap file found in the dropped folder.")
+                self.bag_path_label.setText(
+                    "Error: No .mcap file, and no scene_scan.laz/scene_image.jpg/"
+                    "scene_intrinsics_extrinsics.npz set, found in the dropped folder."
+                )
             else:
                 self.bag_path_label.setText("Error: Multiple .mcap files found. Please drop one.")
         else:
