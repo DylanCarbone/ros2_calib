@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import argparse
 import sys
 
 from PySide6.QtWidgets import QApplication
@@ -27,9 +28,20 @@ from PySide6.QtWidgets import QApplication
 from .main_window import MainWindow
 
 
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description="ros2_calib - LiDAR-Camera Calibration Tool")
+    parser.add_argument("--laz", help="Path to the point cloud (.laz/.las) to pre-fill on launch")
+    parser.add_argument("--image", help="Path to the camera image to pre-fill on launch")
+    parser.add_argument(
+        "--bundle", help="Path to the calibration bundle (.npz) to pre-fill on launch"
+    )
+    return parser.parse_known_args(argv)[0]
+
+
 def main():
+    args = parse_args(sys.argv[1:])
     app = QApplication(sys.argv)
-    window = MainWindow()
+    window = MainWindow(laz_path=args.laz, image_path=args.image, bundle_path=args.bundle)
     window.show()
     sys.exit(app.exec())
 

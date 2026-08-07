@@ -23,7 +23,7 @@
 from functools import partial
 
 import cv2
-import matplotlib.cm as cm
+import matplotlib as mpl
 import numpy as np
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QImage, QKeyEvent, QPainter, QPen, QPixmap
@@ -946,7 +946,7 @@ class CalibrationWidget(QWidget):
             return
 
         self.kdtree = KDTree(self.points_proj_valid)
-        cmap = cm.get_cmap(self.colormap_combo.currentText())
+        cmap = mpl.colormaps[self.colormap_combo.currentText()]
 
         # Choose coloring mode
         colorization_mode = self.colorization_mode_combo.currentText()
@@ -1040,7 +1040,7 @@ class CalibrationWidget(QWidget):
         self.second_kdtree = KDTree(self.second_points_proj_valid)
 
         # Use different colormap for second point cloud (e.g., warm colors vs cool colors)
-        second_cmap = cm.get_cmap("plasma")  # Different from master point cloud colormap
+        second_cmap = mpl.colormaps["plasma"]  # Different from master point cloud colormap
 
         # Color by intensity with different range
         min_val = np.quantile(self.second_intensities_valid, 0.01)
