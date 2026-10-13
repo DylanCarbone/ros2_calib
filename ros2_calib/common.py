@@ -67,6 +67,9 @@ class Colors:
     CORRESPONDENCE_3D = "cyan"
     SELECTION_HIGHLIGHT = "cyan"
     CROSS_MARKER = "yellow"
+    # LiDAR points the initial extrinsics were solved from (fluorescent blue, with a white outline)
+    INITIAL_EXTRINSICS_POINTS = "#1F51FF"
+    INITIAL_EXTRINSICS_POINTS_OUTLINE = "white"
 
 
 class AppConstants:
@@ -74,9 +77,11 @@ class AppConstants:
 
     # Default values
     DEFAULT_POINT_SIZE = 4
-    DEFAULT_COLORMAP = "inferno"
+    DEFAULT_COLORMAP = "magma"
     DEFAULT_TRANSLATION_STEP = 1.0  # cm
     DEFAULT_ROTATION_STEP = 0.1  # degrees
+    # Camera movement (m) after which the hidden point removal is flagged as out of date
+    HPR_STALE_DISTANCE_M = 0.05
 
     # Minimum requirements
     MIN_CORRESPONDENCES = 4

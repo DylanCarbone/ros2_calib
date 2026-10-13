@@ -41,17 +41,18 @@ from PySide6.QtWidgets import (
 
 from . import ros_utils
 from . import tf_transformations as tf
-from .bundle_loader import load_calibration_bundle
+from .bundle_loader import load_calibration_bundle, load_marked_points
 from .calibration_widget import CalibrationWidget
 from .common import UIStyles
 
 POINTCLOUD_EXTENSIONS = (".laz", ".las")
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 BUNDLE_EXTENSIONS = (".npz",)
+POINTS_EXTENSIONS = (".csv",)
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, laz_path=None, image_path=None, bundle_path=None):
+    def __init__(self, laz_path=None, image_path=None, bundle_path=None, points_path=None):
         super().__init__()
         self.setWindowTitle("ros2_calib - LiDAR-Camera Calibration Tool")
         self.setGeometry(100, 100, 1800, 800)
@@ -61,6 +62,8 @@ class MainWindow(QMainWindow):
         self.laz_path = None
         self.image_path = None
         self.bundle_path = None
+        # Optional .csv of the LiDAR points the initial extrinsics were solved from
+        self.points_path = None
 
         # Data produced from the loaded inputs
         self.image_msg = None
@@ -68,6 +71,7 @@ class MainWindow(QMainWindow):
         self.camerainfo_msg = None
         self.intrinsics_matrix = None
         self.distortion_matrix = None
+        self.marked_points = None
 
         # Current transform is kept in the "camera pose expressed in the
         # lidar frame" convention expected by CalibrationWidget's
@@ -89,6 +93,8 @@ class MainWindow(QMainWindow):
             self.set_image_path(image_path)
         if bundle_path:
             self.set_bundle_path(bundle_path)
+        if points_path:
+            self.set_points_path(points_path)
 
     # ------------------------------------------------------------------
     # Load view
@@ -102,7 +108,9 @@ class MainWindow(QMainWindow):
         self.load_layout.addWidget(title_label)
         desc_label = QLabel(
             "Load a point cloud (.laz/.las), a camera image, and the calibration "
-            "metadata bundle (.npz) saved by bundle_metadata(). All three are required."
+            "metadata bundle (.npz) saved by bundle_metadata(). All three are required. "
+            "Optionally, also load the LiDAR points (.csv) the initial extrinsics were "
+            "solved from, to highlight them in blue."
         )
         desc_label.setStyleSheet("color: #666; margin-bottom: 10px;")
         self.load_layout.addWidget(desc_label)
@@ -131,10 +139,17 @@ class MainWindow(QMainWindow):
         inputs_layout.addWidget(self.load_bundle_button, 2, 0)
         inputs_layout.addWidget(self.bundle_path_label, 2, 1)
 
+        self.load_points_button = QPushButton("Load Initial Extrinsics Points (.csv)")
+        self.load_points_button.clicked.connect(self.load_points_dialog)
+        self.points_path_label = QLabel("Optional: no points loaded.")
+        self.points_path_label.setStyleSheet("padding: 5px; border: 1px solid gray;")
+        inputs_layout.addWidget(self.load_points_button, 3, 0)
+        inputs_layout.addWidget(self.points_path_label, 3, 1)
+
         inputs_layout.setColumnStretch(1, 1)
         self.load_layout.addWidget(inputs_group)
 
-        drag_drop_label = QLabel("or Drag & Drop the three files anywhere in this window")
+        drag_drop_label = QLabel("or Drag & Drop the files anywhere in this window")
         drag_drop_label.setStyleSheet("color: #666; font-style: italic;")
         self.load_layout.addWidget(drag_drop_label)
 
@@ -176,6 +191,13 @@ class MainWindow(QMainWindow):
         if file_path:
             self.set_bundle_path(file_path)
 
+    def load_points_dialog(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Open Initial Extrinsics Points", "", "CSV Files (*.csv)"
+        )
+        if file_path:
+            self.set_points_path(file_path)
+
     def set_laz_path(self, path):
         self.laz_path = path
         self.laz_path_label.setText(path)
@@ -191,6 +213,10 @@ class MainWindow(QMainWindow):
         self.bundle_path_label.setText(path)
         self.update_proceed_button_state()
 
+    def set_points_path(self, path):
+        self.points_path = path
+        self.points_path_label.setText(path)
+
     def update_proceed_button_state(self):
         self.proceed_button.setEnabled(
             bool(self.laz_path and self.image_path and self.bundle_path)
@@ -203,6 +229,15 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.load_status_label.setText(f"Error loading calibration data: {e}")
             return
+
+        self.marked_points = None
+        if self.points_path:
+            try:
+                self.marked_points = load_marked_points(self.points_path)
+            except Exception as e:
+                self.load_status_label.setText(f"Error loading initial extrinsics points: {e}")
+                return
+            print(f"Highlighting {len(self.marked_points)} LiDAR points from: {self.points_path}")
 
         self.image_msg = data["image_msg"]
         self.pointcloud_msg = data["pointcloud_msg"]
@@ -337,7 +372,12 @@ class MainWindow(QMainWindow):
             widget.deleteLater()
 
         self.calibration_widget = CalibrationWidget(
-            self.image_msg, self.pointcloud_msg, self.camerainfo_msg, ros_utils, initial_transform
+            self.image_msg,
+            self.pointcloud_msg,
+            self.camerainfo_msg,
+            ros_utils,
+            initial_transform,
+            marked_points_xyz=self.marked_points,
         )
         self.calibration_widget.calibration_completed.connect(self.on_calibration_completed)
         self.stacked_widget.setCurrentIndex(self.stacked_widget.addWidget(self.calibration_widget))
@@ -381,6 +421,8 @@ class MainWindow(QMainWindow):
             self.set_image_path(path)
         elif lower.endswith(BUNDLE_EXTENSIONS):
             self.set_bundle_path(path)
+        elif lower.endswith(POINTS_EXTENSIONS):
+            self.set_points_path(path)
         else:
             self.load_status_label.setText(f"Error: Unrecognised file type: {path}")
 

@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QProgressBar,
     QPushButton,
+    QSlider,
     QSpinBox,
     QTextEdit,
     QVBoxLayout,
@@ -91,6 +92,30 @@ class PointCloudItem(QGraphicsItem):
             painter.drawEllipse(QRectF(x - radius, y - radius, self.point_size, self.point_size))
 
 
+class HighlightedPointsItem(PointCloudItem):
+    """A few points drawn as large outlined circles, above the point cloud."""
+
+    def __init__(self, points, color, point_size, outline_color):
+        super().__init__(points, [], point_size)
+        self.brush = QBrush(QColor(color))
+        self.outline_pen = QPen(QColor(outline_color), 1.5)
+        # Same outline width at any zoom
+        self.outline_pen.setCosmetic(True)
+        self.setZValue(1)
+
+    def boundingRect(self):
+        # Extra margin for the outline
+        margin = self.point_size / 2
+        return super().boundingRect().adjusted(-margin, -margin, margin, margin)
+
+    def paint(self, painter: QPainter, option, widget=None):
+        painter.setPen(self.outline_pen)
+        painter.setBrush(self.brush)
+        radius = self.point_size / 2.0
+        for x, y in self.points:
+            painter.drawEllipse(QRectF(x - radius, y - radius, self.point_size, self.point_size))
+
+
 class ZoomableView(QGraphicsView):
     def __init__(self, scene):
         super().__init__(scene)
@@ -120,8 +145,21 @@ class CalibrationWidget(QWidget):
         ros_utils,
         initial_transform,
         second_pointcloud_msg=None,
+        marked_points_xyz=None,
     ):
         super().__init__()
+        # LiDAR points (N x 3) the initial extrinsics were solved from, highlighted in the view
+        self.marked_points_xyz = (
+            None
+            if marked_points_xyz is None
+            else np.asarray(marked_points_xyz, dtype=np.float64).reshape(-1, 3)
+        )
+        self.marked_points_item = None
+        # Hidden point removal: which points are visible from the camera position it was last
+        # computed at (camera position kept to tell when it is out of date)
+        self.hpr_mask = None
+        self.hpr_camera_position = None
+        self.hpr_update_requested = False
         self.image_msg = image_msg
         self.pointcloud_msg = pointcloud_msg  # Master point cloud
         self.second_pointcloud_msg = second_pointcloud_msg  # Optional second point cloud
@@ -235,6 +273,7 @@ class CalibrationWidget(QWidget):
         # View Controls Section
         view_group = QGroupBox("View Settings")
         view_controls_layout = QFormLayout(view_group)
+        self.view_controls_layout = view_controls_layout
         self.image_res_label = QLabel("N/A")
         view_controls_layout.addRow("Image Resolution:", self.image_res_label)
         self.point_size_spinbox = QSpinBox()
@@ -270,6 +309,80 @@ class CalibrationWidget(QWidget):
         self.max_value_spinbox.setRange(-1e9, 1e9)
         self.max_value_spinbox.setDecimals(2)
         view_controls_layout.addRow("Max Value:", self.max_value_spinbox)
+        self._update_range_labels()
+
+        # Thinning: draws only a share of the points, so dense clouds draw faster and pick easier
+        self.thinning_slider = QSlider(Qt.Horizontal)
+        self.thinning_slider.setRange(1, 100)
+        self.thinning_slider.setValue(100)
+        self.thinning_slider.setMinimumWidth(120)
+        self.thinning_slider.setToolTip(
+            "Share of the points to draw. The same points are kept on every redraw, "
+            "and a lower setting keeps a subset of the points kept by a higher one."
+        )
+        self.thinning_value_label = QLabel("100%")
+        self.thinning_value_label.setMinimumWidth(40)
+        thinning_layout = QHBoxLayout()
+        thinning_layout.addWidget(self.thinning_slider)
+        thinning_layout.addWidget(self.thinning_value_label)
+        view_controls_layout.addRow("Keep Points:", thinning_layout)
+
+        # Hidden point removal (Open3D), from the camera position of the current extrinsics
+        self.hpr_checkbox = QCheckBox("Hidden Point Removal")
+        self.hpr_checkbox.setToolTip(
+            "Hide points the camera can't see because other points are in front of them (Open3D "
+            "hidden point removal), from the camera position of the current extrinsics. Computed "
+            "when view changes are applied, and after Calibrate or Reset All."
+        )
+        view_controls_layout.addRow(self.hpr_checkbox)
+        # Radius factor on a log scale, 10 to 1,000,000: slider value v gives 10 ** (v / 100)
+        self.hpr_radius_slider = QSlider(Qt.Horizontal)
+        self.hpr_radius_slider.setRange(100, 600)
+        # 100, lidarcam's default
+        self.hpr_radius_slider.setValue(200)
+        self.hpr_radius_slider.setMinimumWidth(120)
+        self.hpr_radius_slider.setToolTip(
+            "Sphere radius of the hidden point removal, as a multiple of the point cloud's "
+            "bounding-box diagonal (radius_factor in lidarcam's filter_laz_hidden_points). "
+            "Larger values hide fewer points."
+        )
+        self.hpr_radius_value_label = QLabel()
+        self.hpr_radius_value_label.setMinimumWidth(60)
+        hpr_radius_layout = QHBoxLayout()
+        hpr_radius_layout.addWidget(self.hpr_radius_slider)
+        hpr_radius_layout.addWidget(self.hpr_radius_value_label)
+        view_controls_layout.addRow("HPR Radius Factor:", hpr_radius_layout)
+        self.hpr_min_distance_spinbox = QDoubleSpinBox()
+        self.hpr_min_distance_spinbox.setRange(0.0, 100.0)
+        self.hpr_min_distance_spinbox.setDecimals(2)
+        self.hpr_min_distance_spinbox.setSingleStep(0.5)
+        self.hpr_min_distance_spinbox.setValue(1.0)
+        self.hpr_min_distance_spinbox.setSuffix(" m")
+        self.hpr_min_distance_spinbox.setToolTip(
+            "Points nearer than this to the camera are left out of the hidden point removal and "
+            "hidden, as LIDAR_MIN_DISTANCE_M in the notebook. A few very close points otherwise "
+            "hide most of the scene."
+        )
+        view_controls_layout.addRow("HPR Min Distance:", self.hpr_min_distance_spinbox)
+        self.hpr_status_label = QLabel()
+        self.hpr_status_label.setWordWrap(True)
+        view_controls_layout.addRow("HPR Status:", self.hpr_status_label)
+        self._on_hpr_radius_changed(self.hpr_radius_slider.value())
+        self._update_hpr_controls()
+
+        self.points_shown_label = QLabel("N/A")
+        view_controls_layout.addRow("Points Shown:", self.points_shown_label)
+
+        # LiDAR points the initial extrinsics were solved from; only shown when they were loaded
+        self.show_marked_points_checkbox = QCheckBox("Show Initial Extrinsics Points")
+        self.show_marked_points_checkbox.setToolTip(
+            "LiDAR points the initial extrinsics were solved from, in fluorescent blue. They are "
+            "drawn whatever the distance range or thinning, and can't be picked."
+        )
+        self.show_marked_points_checkbox.setChecked(True)
+        self.show_marked_points_checkbox.setVisible(self.marked_points_xyz is not None)
+        self.show_marked_points_checkbox.toggled.connect(self._on_show_marked_points_toggled)
+        view_controls_layout.addRow(self.show_marked_points_checkbox)
 
         # Image rectification checkbox
         self.rectify_checkbox = QCheckBox("Rectify Image")
@@ -285,7 +398,7 @@ class CalibrationWidget(QWidget):
         view_controls_layout.addRow(self.rectify_checkbox)
 
         self.apply_view_button = QPushButton("Apply View Changes")
-        self.apply_view_button.clicked.connect(self.redraw_points)
+        self.apply_view_button.clicked.connect(self.apply_view_changes)
         view_controls_layout.addRow(self.apply_view_button)
 
         # Add Clean Occluded Points button here
@@ -443,6 +556,11 @@ class CalibrationWidget(QWidget):
         self.colorization_mode_combo.currentTextChanged.connect(self._on_colorization_mode_changed)
         self.min_value_spinbox.valueChanged.connect(self._on_view_params_changed)
         self.max_value_spinbox.valueChanged.connect(self._on_view_params_changed)
+        self.thinning_slider.valueChanged.connect(self._on_thinning_changed)
+        self.hpr_checkbox.toggled.connect(self._on_hpr_toggled)
+        self.hpr_radius_slider.valueChanged.connect(self._on_hpr_radius_changed)
+        self.hpr_radius_slider.valueChanged.connect(self._on_view_params_changed)
+        self.hpr_min_distance_spinbox.valueChanged.connect(self._on_view_params_changed)
         return right_layout
 
     def keyPressEvent(self, event: QKeyEvent):
@@ -487,10 +605,148 @@ class CalibrationWidget(QWidget):
     def _on_view_params_changed(self):
         self.apply_view_button.setStyleSheet(UIStyles.HIGHLIGHT_BUTTON)
 
+    def _on_thinning_changed(self, value):
+        self.thinning_value_label.setText(f"{value}%")
+        self._on_view_params_changed()
+
+    def _on_show_marked_points_toggled(self, checked):
+        if self.marked_points_item is not None:
+            self.marked_points_item.setVisible(checked)
+
+    def hpr_radius_factor(self):
+        """Radius factor set by the slider, to 3 significant figures (as shown next to it)."""
+        return float(f"{10 ** (self.hpr_radius_slider.value() / 100):.3g}")
+
+    def _on_hpr_radius_changed(self, value):
+        self.hpr_radius_value_label.setText(f"{self.hpr_radius_factor():,.0f}")
+
+    def _on_hpr_toggled(self, checked):
+        self._update_hpr_controls()
+        self._on_view_params_changed()
+
+    def _update_hpr_controls(self):
+        """Enable the radius and min distance controls only while hidden point removal is on."""
+        enabled = self.hpr_checkbox.isChecked()
+        self.hpr_radius_slider.setEnabled(enabled)
+        self.hpr_min_distance_spinbox.setEnabled(enabled)
+
+    def apply_view_changes(self):
+        """Redraw with the current view settings, recomputing the hidden point removal from the
+        camera position of the current extrinsics."""
+        self.hpr_update_requested = True
+        self.redraw_points()
+
+    def _camera_position(self):
+        """Camera centre in the LiDAR frame (p_cam = R @ p_lidar + t, so the centre is -R^T t)."""
+        return -self.extrinsics[:3, :3].T @ self.extrinsics[:3, 3]
+
+    def _hpr_camera_offset(self):
+        """Distance (m) the camera has moved since hidden point removal was computed (0 if off)."""
+        if not self.hpr_checkbox.isChecked() or self.hpr_camera_position is None:
+            return 0.0
+        return float(np.linalg.norm(self._camera_position() - self.hpr_camera_position))
+
+    def _update_hpr_mask(self):
+        """Mark the points visible from the camera position of the current extrinsics, by Open3D's
+        hidden point removal on the points beyond the HPR min distance. The sphere radius is the
+        cloud's bounding-box diagonal times the radius factor, as in lidarcam's
+        filter_laz_hidden_points. Points behind others, or nearer than the min distance, are
+        False."""
+        import open3d as o3d
+
+        self.progress_bar.setVisible(True)
+        QApplication.processEvents()
+        camera_position = self._camera_position()
+        points = self.points_xyz.astype(np.float64)
+        distances = np.linalg.norm(points - camera_position, axis=1)
+        candidates = np.where(distances >= self.hpr_min_distance_spinbox.value())[0]
+        self.hpr_mask = np.zeros(len(points), dtype=bool)
+        if len(candidates) >= 4:
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(points[candidates])
+            diameter = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
+            try:
+                _, visible = pcd.hidden_point_removal(
+                    camera_position.tolist(), diameter * self.hpr_radius_factor()
+                )
+                self.hpr_mask[candidates[np.asarray(visible)]] = True
+            except RuntimeError as e:
+                print(f"[WARNING] Hidden point removal failed, showing every point: {e}")
+                self.hpr_mask[candidates] = True
+        self.hpr_camera_position = camera_position
+        self.progress_bar.setVisible(False)
+
+    def _update_hpr_status(self):
+        if not self.hpr_checkbox.isChecked() or self.hpr_mask is None:
+            self.hpr_status_label.setText("Off")
+            return
+        hidden = int(np.sum(~self.hpr_mask[self.in_view_indices]))
+        text = f"{hidden:,} of {len(self.in_view_indices):,} in view hidden"
+        offset = self._hpr_camera_offset()
+        if offset > AppConstants.HPR_STALE_DISTANCE_M:
+            text += (
+                f"; computed from a camera position {offset:.2f} m away, "
+                "press Apply View Changes to update"
+            )
+        self.hpr_status_label.setText(text)
+
+    def project_marked_points(self):
+        """Draw the LiDAR points the initial extrinsics were solved from, projected with the current
+        extrinsics, as fluorescent blue markers above the point cloud."""
+        if self.marked_points_item is not None and self.marked_points_item.scene():
+            self.scene.removeItem(self.marked_points_item)
+        self.marked_points_item = None
+        if self.marked_points_xyz is None:
+            return
+
+        # Same projection as the point cloud, so the markers sit on the cloud's points
+        K = np.array(self.camerainfo_msg.k).reshape(3, 3)
+        rvec, _ = cv2.Rodrigues(self.extrinsics[:3, :3])
+        tvec = self.extrinsics[:3, 3]
+        dist_coeffs = None if self.is_rectification_enabled else np.array(self.camerainfo_msg.d)
+        points_proj, _ = cv2.projectPoints(self.marked_points_xyz, rvec, tvec, K, dist_coeffs)
+        points_proj = points_proj.reshape(-1, 2)
+        z_cam = (self.extrinsics[:3, :3] @ self.marked_points_xyz.T).T[:, 2] + tvec[2]
+        in_view = (
+            (z_cam > 0)
+            & (points_proj[:, 0] >= 0)
+            & (points_proj[:, 0] < self.camerainfo_msg.width)
+            & (points_proj[:, 1] >= 0)
+            & (points_proj[:, 1] < self.camerainfo_msg.height)
+        )
+        self.show_marked_points_checkbox.setText(
+            f"Show Initial Extrinsics Points ({in_view.sum()} of {len(in_view)} in view)"
+        )
+
+        self.marked_points_item = HighlightedPointsItem(
+            points_proj[in_view],
+            Colors.INITIAL_EXTRINSICS_POINTS,
+            max(12, 3 * self.point_size_spinbox.value()),
+            Colors.INITIAL_EXTRINSICS_POINTS_OUTLINE,
+        )
+        self.marked_points_item.setVisible(self.show_marked_points_checkbox.isChecked())
+        self.scene.addItem(self.marked_points_item)
+
     def _on_colorization_mode_changed(self):
-        """Update min/max values when colorization mode changes."""
+        """Update min/max values and their labels when colorization mode changes."""
+        self._update_range_labels()
         self._update_min_max_values_for_mode()
         self._on_view_params_changed()
+
+    def _update_range_labels(self):
+        """Label the min/max spinboxes for the current colorization mode."""
+        if self.colorization_mode_combo.currentText() == "Distance":
+            labels = ("Min Distance (m):", "Max Distance (m):")
+            tooltip = (
+                "Distance from the camera: points outside this range are hidden, "
+                "and the colormap spans it"
+            )
+        else:
+            labels = ("Min Intensity:", "Max Intensity:")
+            tooltip = "Intensity range the colormap spans"
+        for spinbox, label in zip((self.min_value_spinbox, self.max_value_spinbox), labels):
+            self.view_controls_layout.labelForField(spinbox).setText(label)
+            spinbox.setToolTip(tooltip)
 
     def _update_min_max_values_for_mode(self):
         """Update min/max spinbox values based on current colorization mode."""
@@ -499,15 +755,14 @@ class CalibrationWidget(QWidget):
 
         colorization_mode = self.colorization_mode_combo.currentText()
         if colorization_mode == "Distance":
-            # Calculate distances for all valid points
-            if hasattr(self, "valid_indices") and len(self.valid_indices) > 0:
+            # Full distance range of the points in view, rounded outwards to the spinboxes'
+            # 2 decimals, so switching to Distance hides no points until the range is narrowed
+            if hasattr(self, "in_view_indices") and len(self.in_view_indices) > 0:
                 tvec = self.extrinsics[:3, 3]
-                points_cam = (self.extrinsics[:3, :3] @ self.points_xyz.T).T + tvec
-                valid_points_cam = points_cam[self.valid_indices]
-                distances = np.linalg.norm(valid_points_cam, axis=1)
-                min_dist, max_dist = np.quantile(distances, [0.01, 0.99])
-                self.min_value_spinbox.setValue(min_dist)
-                self.max_value_spinbox.setValue(max_dist)
+                points_cam = (self.extrinsics[:3, :3] @ self.points_xyz[self.in_view_indices].T).T
+                distances = np.linalg.norm(points_cam + tvec, axis=1)
+                self.min_value_spinbox.setValue(np.floor(distances.min() * 100) / 100)
+                self.max_value_spinbox.setValue(np.ceil(distances.max() * 100) / 100)
         else:
             # Intensity mode - use intensity values
             if hasattr(self, "intensities") and self.intensities.size > 0:
@@ -889,7 +1144,11 @@ class CalibrationWidget(QWidget):
         self.project_pointcloud(self.extrinsics, re_read_cloud=False)
         if self.has_second_pointcloud:
             self.project_second_pointcloud()
-        self.apply_view_button.setStyleSheet(self.default_button_style)
+        # Stays highlighted while the hidden point removal is from an earlier camera position
+        hpr_out_of_date = self._hpr_camera_offset() > AppConstants.HPR_STALE_DISTANCE_M
+        self.apply_view_button.setStyleSheet(
+            UIStyles.HIGHLIGHT_BUTTON if hpr_out_of_date else self.default_button_style
+        )
 
     def project_pointcloud(self, extrinsics=None, re_read_cloud=True):
         if extrinsics is not None:
@@ -898,8 +1157,10 @@ class CalibrationWidget(QWidget):
         if self.point_cloud_item is not None and self.point_cloud_item.scene():
             self.scene.removeItem(self.point_cloud_item)
         self.point_cloud_item = None
+        self.project_marked_points()
 
         if re_read_cloud:
+            first_load = not hasattr(self, "points_xyz")
             cloud_arr = self.ros_utils.pointcloud2_to_structured_array(self.pointcloud_msg)
             valid_mask = (
                 np.isfinite(cloud_arr["x"])
@@ -909,8 +1170,13 @@ class CalibrationWidget(QWidget):
             cloud_arr = cloud_arr[valid_mask]
             self.points_xyz = np.vstack([cloud_arr["x"], cloud_arr["y"], cloud_arr["z"]]).T
             self.intensities = cloud_arr["intensity"]
-            if self.intensities.size > 0:
-                # Set initial min/max values based on current colorization mode
+            # Fixed random key per point; thinning keeps the points whose key is below the kept
+            # share, so the same points are kept on every redraw
+            self.thinning_keys = np.random.default_rng(0).random(self.points_xyz.shape[0])
+            # Set initial min/max values based on current colorization mode. Later re-reads
+            # (Calibrate, Reset All, Rectify Image) keep the values set in the UI, such as a
+            # distance range
+            if first_load and self.intensities.size > 0:
                 self._update_min_max_values_for_mode()
 
         if not hasattr(self, "points_xyz") or self.points_xyz.shape[0] == 0:
@@ -938,9 +1204,40 @@ class CalibrationWidget(QWidget):
         if self.occlusion_mask is not None and len(self.occlusion_mask) == len(mask):
             mask = np.logical_and(mask, self.occlusion_mask)
 
+        # Points in view, before the distance filter, hidden point removal and thinning
+        self.in_view_indices = np.where(mask)[0]
+
+        # In Distance mode, hides points outside the distance range
+        colorization_mode = self.colorization_mode_combo.currentText()
+        if colorization_mode == "Distance":
+            distances_all = np.linalg.norm(points_cam, axis=1)
+            mask &= (distances_all >= self.min_value_spinbox.value()) & (
+                distances_all <= self.max_value_spinbox.value()
+            )
+        # Hidden point removal, recomputed when view changes are applied and after Calibrate or
+        # Reset All (which re-read the cloud). In between, such as while fine-tuning, the last
+        # result is reused so redraws stay fast. Applied before thinning, so points thinned out
+        # of the view still hide the points behind them
+        if self.hpr_checkbox.isChecked():
+            if (
+                self.hpr_update_requested
+                or re_read_cloud
+                or self.hpr_mask is None
+                or len(self.hpr_mask) != len(mask)
+            ):
+                self._update_hpr_mask()
+            mask &= self.hpr_mask
+        self.hpr_update_requested = False
+        self._update_hpr_status()
+        # Thinning
+        mask &= self.thinning_keys < self.thinning_slider.value() / 100.0
+
         self.valid_indices = np.where(mask)[0]
         self.points_proj_valid = points_proj_cv[self.valid_indices]
         self.intensities_valid = self.intensities[self.valid_indices]
+        self.points_shown_label.setText(
+            f"{len(self.valid_indices):,} of {len(self.in_view_indices):,} in view"
+        )
         if self.points_proj_valid.shape[0] == 0:
             self.kdtree = None
             return
@@ -949,7 +1246,6 @@ class CalibrationWidget(QWidget):
         cmap = mpl.colormaps[self.colormap_combo.currentText()]
 
         # Choose coloring mode
-        colorization_mode = self.colorization_mode_combo.currentText()
         if colorization_mode == "Distance":
             # Distance-based coloring: use distance from camera
             valid_points_cam = points_cam[self.valid_indices]

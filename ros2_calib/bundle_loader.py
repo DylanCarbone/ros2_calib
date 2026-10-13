@@ -108,6 +108,23 @@ def _load_image(path: str) -> ros_utils.Image:
     )
 
 
+def load_marked_points(path: str) -> np.ndarray:
+    """
+    Load 3D LiDAR points (N x 3) from a CSV holding x, y, z in its first three
+    columns, such as the scan points the initial extrinsics were solved from.
+    A header row, if present, is skipped.
+    """
+    data = np.genfromtxt(path, delimiter=",", ndmin=2)
+    if data.shape[1] < 3:
+        raise ValueError(f"'{os.path.basename(path)}' needs x, y, z columns")
+    points = data[:, :3]
+    # Rows that aren't numbers, such as a header, are read as NaN
+    points = points[np.all(np.isfinite(points), axis=1)]
+    if len(points) == 0:
+        raise ValueError(f"'{os.path.basename(path)}' holds no x, y, z points")
+    return points
+
+
 def find_missing_bundle_keys(bundle_path: str) -> list:
     """Return a list of required npz keys that are missing from bundle_path."""
     with np.load(bundle_path) as npz:

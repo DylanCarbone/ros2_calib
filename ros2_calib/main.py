@@ -35,13 +35,23 @@ def parse_args(argv):
     parser.add_argument(
         "--bundle", help="Path to the calibration bundle (.npz) to pre-fill on launch"
     )
+    parser.add_argument(
+        "--points",
+        help="Optional .csv of the 3D LiDAR points (x, y, z per row) the initial extrinsics were "
+        "solved from, highlighted in the calibration view",
+    )
     return parser.parse_known_args(argv)[0]
 
 
 def main():
     args = parse_args(sys.argv[1:])
     app = QApplication(sys.argv)
-    window = MainWindow(laz_path=args.laz, image_path=args.image, bundle_path=args.bundle)
+    window = MainWindow(
+        laz_path=args.laz,
+        image_path=args.image,
+        bundle_path=args.bundle,
+        points_path=args.points,
+    )
     window.show()
     sys.exit(app.exec())
 
