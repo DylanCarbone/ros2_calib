@@ -25,10 +25,20 @@ from functools import partial
 import cv2
 import matplotlib as mpl
 import numpy as np
-from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QImage, QKeyEvent, QPainter, QPen, QPixmap
+from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QImage,
+    QKeyEvent,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -36,8 +46,10 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGraphicsEllipseItem,
     QGraphicsItem,
+    QGraphicsPathItem,
     QGraphicsPixmapItem,
     QGraphicsScene,
+    QGraphicsSimpleTextItem,
     QGraphicsView,
     QGridLayout,
     QGroupBox,
@@ -49,6 +61,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSlider,
     QSpinBox,
+    QStackedWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -59,6 +72,7 @@ from scipy.spatial.transform import Rotation
 from . import calibration
 from .common import AppConstants, Colors, UIStyles
 from .lidar_cleaner import LiDARCleaner
+from .view3d import PairedViewsSplitter, PointCloudView3D
 
 
 class PointCloudItem(QGraphicsItem):
@@ -134,6 +148,80 @@ class ZoomableView(QGraphicsView):
             self.scale(zoom_out_factor, zoom_out_factor)
 
 
+class ImagePickView(ZoomableView):
+    """The camera image on its own, zoomed with the wheel and panned by dragging, for picking image
+    points: a click (press and release without dragging) emits the image pixel clicked."""
+
+    clicked = Signal(float, float)
+    # Mouse movement (px) before a press counts as a drag rather than a click
+    DRAG_THRESHOLD_PX = 4
+
+    def __init__(self):
+        scene = QGraphicsScene()
+        super().__init__(scene)
+        # A view doesn't own its scene, so it is kept here to stay alive
+        self.image_scene = scene
+        self.pixmap_item = None
+        self.marker_items = []
+        self._press_pos = None
+
+    def set_image(self, image_rgb):
+        height, width = image_rgb.shape[:2]
+        image = QImage(image_rgb.data, width, height, 3 * width, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(image)
+        if self.pixmap_item is None:
+            self.pixmap_item = self.scene().addPixmap(pixmap)
+        else:
+            self.pixmap_item.setPixmap(pixmap)
+        self.scene().setSceneRect(QRectF(0, 0, width, height))
+
+    def fit(self):
+        """Show the whole image."""
+        self.fitInView(self.scene().sceneRect(), Qt.KeepAspectRatio)
+
+    def set_markers(self, markers):
+        """Replace the markers, given as (x, y, label, colour, size) per marker: crosses at image
+        pixel (x, y) with their label, the same size on screen at any zoom."""
+        for item in self.marker_items:
+            self.scene().removeItem(item)
+        self.marker_items = []
+        for x, y, label, color, size in markers:
+            path = QPainterPath()
+            path.moveTo(-size, 0)
+            path.lineTo(size, 0)
+            path.moveTo(0, -size)
+            path.lineTo(0, size)
+            cross = QGraphicsPathItem(path)
+            cross.setPen(QPen(color, 2.5))
+            cross.setPos(x, y)
+            cross.setFlag(QGraphicsItem.ItemIgnoresTransformations)
+            cross.setZValue(2)
+            if label:
+                text = QGraphicsSimpleTextItem(label, cross)
+                font = text.font()
+                font.setBold(True)
+                text.setFont(font)
+                text.setBrush(QBrush(color))
+                # Dark outline, to read on any background
+                text.setPen(QPen(QColor("black"), 0.6))
+                text.setPos(size + 2, -size - text.boundingRect().height())
+            self.scene().addItem(cross)
+            self.marker_items.append(cross)
+
+    def mousePressEvent(self, event):
+        self._press_pos = event.position()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._press_pos is not None:
+            moved = event.position() - self._press_pos
+            if abs(moved.x()) + abs(moved.y()) < self.DRAG_THRESHOLD_PX:
+                scene_pos = self.mapToScene(event.position().toPoint())
+                self.clicked.emit(scene_pos.x(), scene_pos.y())
+        self._press_pos = None
+        super().mouseReleaseEvent(event)
+
+
 class CalibrationWidget(QWidget):
     calibration_completed = Signal(object)  # Signal to emit calibrated transform(s)
 
@@ -146,8 +234,16 @@ class CalibrationWidget(QWidget):
         initial_transform,
         second_pointcloud_msg=None,
         marked_points_xyz=None,
+        marked_image_points=None,
     ):
         super().__init__()
+        # Whether the image and 3D LiDAR views have been shown yet (they are fitted to the
+        # camera's view the first time)
+        self.views_3d_initialised = False
+        # Colours recorded by the scanner, when the point cloud has them
+        self.point_rgb = None
+        # Min/max values are set from the cloud when it is first projected
+        self.range_initialisation_pending = False
         # LiDAR points (N x 3) the initial extrinsics were solved from, highlighted in the view
         self.marked_points_xyz = (
             None
@@ -155,6 +251,13 @@ class CalibrationWidget(QWidget):
             else np.asarray(marked_points_xyz, dtype=np.float64).reshape(-1, 3)
         )
         self.marked_points_item = None
+        # Image points (N x 2) the initial extrinsics were solved from, paired row by row with
+        # marked_points_xyz; each pair is a correspondence from the start (and after Reset All)
+        self.marked_image_points = (
+            None
+            if marked_image_points is None
+            else np.asarray(marked_image_points, dtype=np.float64).reshape(-1, 2)
+        )
         # Hidden point removal: which points are visible from the camera position it was last
         # computed at (camera position kept to tell when it is out of date)
         self.hpr_mask = None
@@ -165,7 +268,7 @@ class CalibrationWidget(QWidget):
         self.second_pointcloud_msg = second_pointcloud_msg  # Optional second point cloud
         self.camerainfo_msg = camerainfo_msg
         self.ros_utils = ros_utils
-        self.correspondences = {}  # Master LiDAR to camera correspondences
+        self.correspondences = self._initial_correspondences()  # Master LiDAR to camera
         self.lidar_to_lidar_correspondences = {}  # Second LiDAR to master LiDAR correspondences
 
         # Use inverse as transform point cloud to camera frame
@@ -210,7 +313,11 @@ class CalibrationWidget(QWidget):
         self.scene = QGraphicsScene()
         self.view = ZoomableView(self.scene)
         self.view.viewport().installEventFilter(self)
-        left_layout.addWidget(self.view)
+        self.view_stack = QStackedWidget()
+        self.view_stack.addWidget(self.view)
+        self.view_stack.addWidget(self._setup_3d_views())
+        left_layout.addLayout(self._setup_view_toolbar())
+        left_layout.addWidget(self.view_stack)
 
         right_controls_layout = self._setup_controls()
 
@@ -222,8 +329,210 @@ class CalibrationWidget(QWidget):
         if self.has_second_pointcloud:
             self.project_second_pointcloud()
         self._update_inputs_from_extrinsics()
+        self.update_corr_list()
         self._update_calibrate_button_highlight()
         self.display_camera_intrinsics()
+
+    # ------------------------------------------------------------------
+    # Image and 3D LiDAR views
+    # ------------------------------------------------------------------
+    def _setup_3d_views(self):
+        """The camera image and the LiDAR cloud in 3D, in two views shown in place of the 2D view
+        when toggled: image points are picked in the image, and LiDAR points in the 3D view,
+        which starts at the camera's viewpoint and turns on its own."""
+        self.image_pick_view = ImagePickView()
+        self.image_pick_view.clicked.connect(self._on_image_view_click)
+        self.lidar_view3d = PointCloudView3D()
+        self.lidar_view3d.marker_provider = self._lidar_markers_3d
+        self.lidar_view3d.clicked.connect(self._on_lidar_3d_click)
+        self.lidar_view3d_title = QLabel("3D LiDAR: click LiDAR points here")
+        # Side by side or stacked, whichever shows the views larger
+        self.views_3d_splitter = PairedViewsSplitter()
+        for title, view in (
+            (
+                QLabel("Image: click image points here (wheel: zoom, drag: pan)"),
+                self.image_pick_view,
+            ),
+            (self.lidar_view3d_title, self.lidar_view3d),
+        ):
+            pane = QWidget()
+            pane_layout = QVBoxLayout(pane)
+            pane_layout.setContentsMargins(0, 0, 0, 0)
+            title.setStyleSheet("font-weight: bold; padding: 2px;")
+            pane_layout.addWidget(title)
+            pane_layout.addWidget(view, 1)
+            self.views_3d_splitter.addWidget(pane)
+        self.views_3d_splitter.setSizes([10000, 10000])
+        return self.views_3d_splitter
+
+    def _setup_view_toolbar(self):
+        """Buttons switching between the 2D view (image with the LiDAR projected onto it) and the
+        image and 3D LiDAR views."""
+        toolbar = QHBoxLayout()
+        self.view_2d_button = QPushButton("2D Image")
+        self.view_3d_button = QPushButton("Image + 3D LiDAR")
+        self.view_3d_button.setToolTip(
+            "The image, and the LiDAR cloud in 3D in its scanner colours. Pick image points in "
+            "the image and LiDAR points in the 3D view (left-drag: orbit, right-drag: pan, "
+            "wheel: zoom, middle-click: orbit around the point clicked); correspondences are "
+            "numbered in both."
+        )
+        view_buttons = QButtonGroup(self)
+        view_buttons.setExclusive(True)
+        for button in (self.view_2d_button, self.view_3d_button):
+            button.setCheckable(True)
+            view_buttons.addButton(button)
+            toolbar.addWidget(button)
+        self.view_2d_button.setChecked(True)
+        self.view_3d_button.toggled.connect(self._on_view_mode_toggled)
+
+        self.reset_3d_view_button = QPushButton("Reset Views")
+        self.reset_3d_view_button.setToolTip(
+            "Whole image, and the 3D view back at the camera's viewpoint"
+        )
+        self.reset_3d_view_button.clicked.connect(self._reset_3d_views)
+        self.reset_3d_view_button.setEnabled(False)
+        toolbar.addSpacing(20)
+        toolbar.addWidget(self.reset_3d_view_button)
+        self.view3d_status_label = QLabel("")
+        self.view3d_status_label.setStyleSheet("color: #666;")
+        toolbar.addSpacing(20)
+        toolbar.addWidget(self.view3d_status_label, 1)
+        return toolbar
+
+    def _is_3d_view_shown(self):
+        return hasattr(self, "view_stack") and self.view_stack.currentIndex() == 1
+
+    def _reset_3d_views(self):
+        self.image_pick_view.fit()
+        self.lidar_view3d.reset_view()
+
+    def _on_view_mode_toggled(self, show_3d):
+        self.reset_3d_view_button.setEnabled(show_3d)
+        if not show_3d:
+            self.view_stack.setCurrentIndex(0)
+            return
+        self.view_stack.setCurrentIndex(1)
+        self._refresh_3d_scene()
+        if not self.views_3d_initialised:
+            # Once the views have their size
+            QTimer.singleShot(0, self._reset_3d_views)
+            self.views_3d_initialised = True
+
+    def _refresh_3d_scene(self):
+        """Show the current image and LiDAR points in the image and 3D LiDAR views."""
+        self.image_pick_view.set_image(self.cv_image)
+        self._update_3d_lidar_layer()
+        self._refresh_3d()
+
+    def _update_3d_lidar_layer(self):
+        """Show the LiDAR points shown in the 2D view, in the camera frame, at the Point Size and
+        in the colours recorded by the scanner (the 2D view's colours when the scan has none),
+        while the 3D view is shown."""
+        if not self._is_3d_view_shown() or not hasattr(self, "valid_indices"):
+            return
+        if self.point_rgb is not None:
+            colors = self.point_rgb[self.valid_indices]
+            self.lidar_view3d_title.setText("3D LiDAR (scanner colours): click LiDAR points here")
+        else:
+            colors = self.valid_colors_rgb
+            self.lidar_view3d_title.setText(
+                "3D LiDAR (colour map: the scan has no colours): click LiDAR points here"
+            )
+        # The 3D view starts from the real camera
+        K = np.array(self.camerainfo_msg.k).reshape(3, 3)
+        height, width = self.cv_image.shape[:2]
+        self.lidar_view3d.set_camera(K[0, 0], K[1, 1], K[0, 2], K[1, 2], width, height)
+        self.views_3d_splitter.aspect = width / height
+        self.lidar_view3d.set_layer(
+            "lidar",
+            self.points_cam_all[self.valid_indices],
+            colors,
+            point_size=self.point_size_spinbox.value(),
+        )
+
+    def _on_image_view_click(self, x, y):
+        """Pick the image point of a correspondence in the image view."""
+        height, width = self.cv_image.shape[:2]
+        if not (0 <= x < width and 0 <= y < height):
+            return
+        if self.selection_mode == "wait_for_2d_click":
+            self.select_image_point(x, y)
+            self.view3d_status_label.setText(
+                "Now click the matching LiDAR point(s) in the 3D view, then press Enter"
+            )
+        elif self.selection_mode == "wait_for_3d_clicks":
+            self.view3d_status_label.setText(
+                "Click the matching LiDAR point(s) in the 3D view, then press Enter"
+            )
+        elif self.selection_mode is not None:
+            self.view3d_status_label.setText("Pick second-LiDAR correspondences in the 2D view")
+
+    def _on_lidar_3d_click(self, x, y):
+        """Pick the LiDAR points of a correspondence in the 3D view."""
+        if self.selection_mode == "wait_for_3d_clicks":
+            index = self.lidar_view3d.pick(x, y, "lidar")
+            if index is not None:
+                self.toggle_lidar_point_selection(index)
+        elif self.selection_mode == "wait_for_2d_click":
+            self.view3d_status_label.setText("Click the image point in the image first")
+        elif self.selection_mode is not None:
+            self.view3d_status_label.setText("Pick second-LiDAR correspondences in the 2D view")
+
+    def _update_image_view_markers(self):
+        """Mark the image points of the correspondences in the image view (yellow crosses,
+        numbered as in the list), and the one in progress."""
+        yellow = QColor(Colors.CORRESPONDENCE_2D)
+        markers = [
+            (x, y, str(number), yellow, 7)
+            for number, (x, y) in enumerate(self.correspondences, start=1)
+        ]
+        if self.selected_2d_point is not None:
+            markers.append((*self.selected_2d_point, "new", yellow, 9))
+        self.image_pick_view.set_markers(markers)
+
+    def _lidar_markers_3d(self):
+        """Markers over the 3D view: the initial extrinsics points (blue), the LiDAR points of
+        the correspondences (cyan, ringed and numbered as in the list at their mean) and those
+        picked for the correspondence in progress."""
+        if not hasattr(self, "points_xyz"):
+            return []
+        rotation, translation = self.extrinsics[:3, :3], self.extrinsics[:3, 3]
+
+        def to_camera(points):
+            return np.asarray(points, dtype=np.float64).reshape(-1, 3) @ rotation.T + translation
+
+        markers = []
+        if self.marked_points_xyz is not None and self.show_marked_points_checkbox.isChecked():
+            markers.append(
+                (
+                    to_camera(self.marked_points_xyz),
+                    QColor(Colors.INITIAL_EXTRINSICS_POINTS),
+                    6,
+                    "dot",
+                )
+            )
+        correspondences = list(self.correspondences.values())
+        if correspondences:
+            indices = [i for corr in correspondences for i in corr["3d_points_indices"]]
+            cyan = QColor(Colors.CORRESPONDENCE_3D)
+            if indices:
+                markers.append((to_camera(self.points_xyz[indices]), cyan, 4, "dot"))
+            means = [corr["3d_mean"] for corr in correspondences]
+            labels = [str(number) for number in range(1, len(means) + 1)]
+            markers.append((to_camera(means), cyan, 9, "ring", labels))
+        pending = [int(self.valid_indices[i]) for i in self.selected_3d_items_map]
+        if pending:
+            markers.append(
+                (to_camera(self.points_xyz[pending]), QColor(Colors.CORRESPONDENCE_3D), 5, "dot")
+            )
+        return markers
+
+    def _refresh_3d(self):
+        """Redraw the image and 3D views' markers after a correspondence changed."""
+        if self._is_3d_view_shown():
+            self._update_image_view_markers()
+            self.lidar_view3d.update()
 
     def has_significant_distortion(self):
         """Check if camera has significant distortion coefficients."""
@@ -299,7 +608,7 @@ class CalibrationWidget(QWidget):
         view_controls_layout.addRow("Colormap:", self.colormap_combo)
         self.colorization_mode_combo = QComboBox()
         self.colorization_mode_combo.addItems(["Intensity", "Distance"])
-        self.colorization_mode_combo.setCurrentText("Intensity")
+        self.colorization_mode_combo.setCurrentText("Distance")
         view_controls_layout.addRow("Color Mode:", self.colorization_mode_combo)
         self.min_value_spinbox = QDoubleSpinBox()
         self.min_value_spinbox.setRange(-1e9, 1e9)
@@ -690,6 +999,19 @@ class CalibrationWidget(QWidget):
             )
         self.hpr_status_label.setText(text)
 
+    def _project_to_image(self, points_xyz):
+        """Image pixels (N x 2) of LiDAR points with the current extrinsics, by the same
+        projection as the point cloud so they sit on the cloud's points, and whether each is in
+        front of the camera."""
+        points_xyz = np.asarray(points_xyz, dtype=np.float64).reshape(-1, 3)
+        K = np.array(self.camerainfo_msg.k).reshape(3, 3)
+        rvec, _ = cv2.Rodrigues(self.extrinsics[:3, :3])
+        tvec = self.extrinsics[:3, 3]
+        dist_coeffs = None if self.is_rectification_enabled else np.array(self.camerainfo_msg.d)
+        points_proj, _ = cv2.projectPoints(points_xyz, rvec, tvec, K, dist_coeffs)
+        z_cam = points_xyz @ self.extrinsics[2, :3] + tvec[2]
+        return points_proj.reshape(-1, 2), z_cam > 0
+
     def project_marked_points(self):
         """Draw the LiDAR points the initial extrinsics were solved from, projected with the current
         extrinsics, as fluorescent blue markers above the point cloud."""
@@ -699,16 +1021,9 @@ class CalibrationWidget(QWidget):
         if self.marked_points_xyz is None:
             return
 
-        # Same projection as the point cloud, so the markers sit on the cloud's points
-        K = np.array(self.camerainfo_msg.k).reshape(3, 3)
-        rvec, _ = cv2.Rodrigues(self.extrinsics[:3, :3])
-        tvec = self.extrinsics[:3, 3]
-        dist_coeffs = None if self.is_rectification_enabled else np.array(self.camerainfo_msg.d)
-        points_proj, _ = cv2.projectPoints(self.marked_points_xyz, rvec, tvec, K, dist_coeffs)
-        points_proj = points_proj.reshape(-1, 2)
-        z_cam = (self.extrinsics[:3, :3] @ self.marked_points_xyz.T).T[:, 2] + tvec[2]
+        points_proj, in_front = self._project_to_image(self.marked_points_xyz)
         in_view = (
-            (z_cam > 0)
+            in_front
             & (points_proj[:, 0] >= 0)
             & (points_proj[:, 0] < self.camerainfo_msg.width)
             & (points_proj[:, 1] >= 0)
@@ -890,13 +1205,19 @@ class CalibrationWidget(QWidget):
         return super().eventFilter(source, event)
 
     def handle_2d_point_selection(self, pos):
-        self.clear_temp_markers()
         scene_pos = self.view.mapToScene(pos)
-        self.selected_2d_point = (scene_pos.x(), scene_pos.y())
-        self.draw_cross_marker(scene_pos, QColor(Colors.CORRESPONDENCE_2D))
+        self.select_image_point(scene_pos.x(), scene_pos.y())
+
+    def select_image_point(self, x, y):
+        """Use image pixel (x, y) as the image point of the next correspondence (from either
+        the 2D view or the 3D view)."""
+        self.clear_temp_markers()
+        self.selected_2d_point = (float(x), float(y))
+        self.draw_cross_marker(QPointF(x, y), QColor(Colors.CORRESPONDENCE_2D))
         self.selection_mode = "wait_for_3d_clicks"
         self.add_corr_button.setText("2. Click on LiDAR Point(s)")
         self.confirm_3d_button.setVisible(True)
+        self._refresh_3d()
 
     def handle_3d_point_selection(self, pos):
         if self.kdtree is None:
@@ -905,7 +1226,11 @@ class CalibrationWidget(QWidget):
         dist, idx = self.kdtree.query([scene_pos.x(), scene_pos.y()], k=1)
         if dist > self.point_size_spinbox.value() * 1.5:
             return
+        self.toggle_lidar_point_selection(int(idx))
 
+    def toggle_lidar_point_selection(self, idx):
+        """Add or remove shown LiDAR point `idx` (an index into valid_indices) from the LiDAR
+        points of the next correspondence (from either the 2D view or the 3D view)."""
         if idx in self.selected_3d_items_map:
             item_to_remove = self.selected_3d_items_map.pop(idx)
             if item_to_remove in self.scene.items():
@@ -924,6 +1249,7 @@ class CalibrationWidget(QWidget):
             self.current_3d_selection.append(item)
             self.selected_3d_items_map[idx] = item
         self._update_confirm_button_state()
+        self._refresh_3d()
 
     def handle_second_lidar_point_selection(self, pos):
         """Handle selection of a point from the second LiDAR point cloud."""
@@ -1014,8 +1340,18 @@ class CalibrationWidget(QWidget):
         self._update_calibrate_button_highlight()
         self._highlight_export_button()
 
+    def _initial_correspondences(self):
+        """Correspondences of the image and LiDAR points the initial extrinsics were solved from.
+        Their LiDAR point is the picked scan point itself, so they have no point indices."""
+        if self.marked_image_points is None or self.marked_points_xyz is None:
+            return {}
+        return {
+            (float(x), float(y)): {"3d_mean": np.copy(point_3d), "3d_points_indices": []}
+            for (x, y), point_3d in zip(self.marked_image_points, self.marked_points_xyz)
+        }
+
     def reset_calibration_state(self):
-        self.correspondences = {}
+        self.correspondences = self._initial_correspondences()
         self.lidar_to_lidar_correspondences = {}
         self.update_corr_list()
         self.extrinsics = np.copy(self.initial_extrinsics)
@@ -1050,6 +1386,7 @@ class CalibrationWidget(QWidget):
         self.confirm_3d_button.setVisible(False)
         self._update_confirm_button_state()
         self.view.setDragMode(QGraphicsView.ScrollHandDrag)
+        self._refresh_3d()
 
     def display_image(self):
         # Decode/load the original image if not already done
@@ -1097,6 +1434,9 @@ class CalibrationWidget(QWidget):
 
         # Re-project point cloud with the updated image
         self.project_pointcloud()
+        # The 3D view's image changes with rectification
+        if self._is_3d_view_shown():
+            self._refresh_3d_scene()
 
     def display_camera_intrinsics(self):
         """Display the camera intrinsic matrix K."""
@@ -1170,14 +1510,21 @@ class CalibrationWidget(QWidget):
             cloud_arr = cloud_arr[valid_mask]
             self.points_xyz = np.vstack([cloud_arr["x"], cloud_arr["y"], cloud_arr["z"]]).T
             self.intensities = cloud_arr["intensity"]
+            # Colours recorded by the scanner (N x 3 RGB), shown in the 3D LiDAR view
+            names = cloud_arr.dtype.names
+            self.point_rgb = (
+                np.column_stack([cloud_arr["red"], cloud_arr["green"], cloud_arr["blue"]])
+                if {"red", "green", "blue"} <= set(names)
+                else None
+            )
             # Fixed random key per point; thinning keeps the points whose key is below the kept
             # share, so the same points are kept on every redraw
             self.thinning_keys = np.random.default_rng(0).random(self.points_xyz.shape[0])
-            # Set initial min/max values based on current colorization mode. Later re-reads
-            # (Calibrate, Reset All, Rectify Image) keep the values set in the UI, such as a
-            # distance range
-            if first_load and self.intensities.size > 0:
-                self._update_min_max_values_for_mode()
+            # Initial min/max values are set once the points in view are known (below). Later
+            # re-reads (Calibrate, Reset All, Rectify Image) keep the values set in the UI, such as
+            # a distance range
+            if first_load:
+                self.range_initialisation_pending = True
 
         if not hasattr(self, "points_xyz") or self.points_xyz.shape[0] == 0:
             return
@@ -1206,6 +1553,11 @@ class CalibrationWidget(QWidget):
 
         # Points in view, before the distance filter, hidden point removal and thinning
         self.in_view_indices = np.where(mask)[0]
+        # Initial min/max values, from the points in view (the full distance range in Distance
+        # mode, so no point is hidden at first)
+        if self.range_initialisation_pending:
+            self._update_min_max_values_for_mode()
+            self.range_initialisation_pending = False
 
         # In Distance mode, hides points outside the distance range
         colorization_mode = self.colorization_mode_combo.currentText()
@@ -1235,11 +1587,16 @@ class CalibrationWidget(QWidget):
         self.valid_indices = np.where(mask)[0]
         self.points_proj_valid = points_proj_cv[self.valid_indices]
         self.intensities_valid = self.intensities[self.valid_indices]
+        # Camera-frame position and image position of every point, for the 3D view
+        self.points_cam_all = points_cam
+        self.points_proj_all = points_proj_cv
         self.points_shown_label.setText(
             f"{len(self.valid_indices):,} of {len(self.in_view_indices):,} in view"
         )
         if self.points_proj_valid.shape[0] == 0:
             self.kdtree = None
+            self.valid_colors_rgb = np.zeros((0, 3), dtype=np.uint8)
+            self._update_3d_lidar_layer()
             return
 
         self.kdtree = KDTree(self.points_proj_valid)
@@ -1265,6 +1622,8 @@ class CalibrationWidget(QWidget):
             self.points_proj_valid, colors, self.point_size_spinbox.value()
         )
         self.scene.addItem(self.point_cloud_item)
+        self.valid_colors_rgb = (colors[:, :3] * 255).astype(np.uint8)
+        self._update_3d_lidar_layer()
 
     def project_second_pointcloud(self, transform=None):
         """Project the second point cloud using the current transformation."""
@@ -1388,6 +1747,7 @@ class CalibrationWidget(QWidget):
             self.clear_all_highlighting()
             self._update_calibrate_button_highlight()
             self._highlight_export_button()
+            self._refresh_3d()
 
     def highlight_from_list(self, current_item, previous_item):
         self.clear_all_highlighting()
@@ -1409,20 +1769,27 @@ class CalibrationWidget(QWidget):
             original_to_valid_idx_map = {
                 orig_idx: valid_idx for valid_idx, orig_idx in enumerate(self.valid_indices)
             }
+            points_2d = []
             for original_point_idx in corr["3d_points_indices"]:
                 valid_idx = original_to_valid_idx_map.get(original_point_idx)
                 if valid_idx is not None and valid_idx < len(self.points_proj_valid):
-                    point_2d = self.points_proj_valid[valid_idx]
-                    item = QGraphicsEllipseItem(
-                        point_2d[0] - point_size / 2,
-                        point_2d[1] - point_size / 2,
-                        point_size,
-                        point_size,
-                    )
-                    item.setPen(QPen(QColor(Colors.CORRESPONDENCE_3D), 2))
-                    item.setBrush(QBrush(QColor(Colors.CORRESPONDENCE_3D)))
-                    self.scene.addItem(item)
-                    self.highlighted_3d_items.append(item)
+                    points_2d.append(self.points_proj_valid[valid_idx])
+            if not corr["3d_points_indices"]:
+                # Initial extrinsics correspondence: its LiDAR point is not one of the cloud's
+                point_2d, in_front = self._project_to_image(corr["3d_mean"])
+                if in_front[0]:
+                    points_2d.append(point_2d[0])
+            for point_2d in points_2d:
+                item = QGraphicsEllipseItem(
+                    point_2d[0] - point_size / 2,
+                    point_2d[1] - point_size / 2,
+                    point_size,
+                    point_size,
+                )
+                item.setPen(QPen(QColor(Colors.CORRESPONDENCE_3D), 2))
+                item.setBrush(QBrush(QColor(Colors.CORRESPONDENCE_3D)))
+                self.scene.addItem(item)
+                self.highlighted_3d_items.append(item)
 
         elif corr_data[0] == "lidar_lidar":
             # Highlight LiDAR-to-LiDAR correspondence

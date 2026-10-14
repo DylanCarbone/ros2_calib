@@ -41,7 +41,12 @@ from PySide6.QtWidgets import (
 
 from . import ros_utils
 from . import tf_transformations as tf
-from .bundle_loader import load_calibration_bundle, load_marked_points
+from .bundle_loader import (
+    is_image_points_csv,
+    load_calibration_bundle,
+    load_marked_image_points,
+    load_marked_points,
+)
 from .calibration_widget import CalibrationWidget
 from .common import UIStyles
 
@@ -52,7 +57,14 @@ POINTS_EXTENSIONS = (".csv",)
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, laz_path=None, image_path=None, bundle_path=None, points_path=None):
+    def __init__(
+        self,
+        laz_path=None,
+        image_path=None,
+        bundle_path=None,
+        points_path=None,
+        image_points_path=None,
+    ):
         super().__init__()
         self.setWindowTitle("ros2_calib - LiDAR-Camera Calibration Tool")
         self.setGeometry(100, 100, 1800, 800)
@@ -64,6 +76,9 @@ class MainWindow(QMainWindow):
         self.bundle_path = None
         # Optional .csv of the LiDAR points the initial extrinsics were solved from
         self.points_path = None
+        # Optional .csv of the matching image points, in the same order, each pair of which is
+        # added as a correspondence
+        self.image_points_path = None
 
         # Data produced from the loaded inputs
         self.image_msg = None
@@ -72,6 +87,7 @@ class MainWindow(QMainWindow):
         self.intrinsics_matrix = None
         self.distortion_matrix = None
         self.marked_points = None
+        self.marked_image_points = None
 
         # Current transform is kept in the "camera pose expressed in the
         # lidar frame" convention expected by CalibrationWidget's
@@ -95,6 +111,8 @@ class MainWindow(QMainWindow):
             self.set_bundle_path(bundle_path)
         if points_path:
             self.set_points_path(points_path)
+        if image_points_path:
+            self.set_image_points_path(image_points_path)
 
     # ------------------------------------------------------------------
     # Load view
@@ -110,8 +128,10 @@ class MainWindow(QMainWindow):
             "Load a point cloud (.laz/.las), a camera image, and the calibration "
             "metadata bundle (.npz) saved by bundle_metadata(). All three are required. "
             "Optionally, also load the LiDAR points (.csv) the initial extrinsics were "
-            "solved from, to highlight them in blue."
+            "solved from, to highlight them in blue, and their matching image points (.csv), "
+            "to start with each pair selected as a correspondence."
         )
+        desc_label.setWordWrap(True)
         desc_label.setStyleSheet("color: #666; margin-bottom: 10px;")
         self.load_layout.addWidget(desc_label)
 
@@ -139,12 +159,19 @@ class MainWindow(QMainWindow):
         inputs_layout.addWidget(self.load_bundle_button, 2, 0)
         inputs_layout.addWidget(self.bundle_path_label, 2, 1)
 
-        self.load_points_button = QPushButton("Load Initial Extrinsics Points (.csv)")
+        self.load_points_button = QPushButton("Load Initial Extrinsics LiDAR Points (.csv)")
         self.load_points_button.clicked.connect(self.load_points_dialog)
-        self.points_path_label = QLabel("Optional: no points loaded.")
+        self.points_path_label = QLabel("Optional: no LiDAR points loaded.")
         self.points_path_label.setStyleSheet("padding: 5px; border: 1px solid gray;")
         inputs_layout.addWidget(self.load_points_button, 3, 0)
         inputs_layout.addWidget(self.points_path_label, 3, 1)
+
+        self.load_image_points_button = QPushButton("Load Initial Extrinsics Image Points (.csv)")
+        self.load_image_points_button.clicked.connect(self.load_image_points_dialog)
+        self.image_points_path_label = QLabel("Optional: no image points loaded.")
+        self.image_points_path_label.setStyleSheet("padding: 5px; border: 1px solid gray;")
+        inputs_layout.addWidget(self.load_image_points_button, 4, 0)
+        inputs_layout.addWidget(self.image_points_path_label, 4, 1)
 
         inputs_layout.setColumnStretch(1, 1)
         self.load_layout.addWidget(inputs_group)
@@ -193,10 +220,17 @@ class MainWindow(QMainWindow):
 
     def load_points_dialog(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Open Initial Extrinsics Points", "", "CSV Files (*.csv)"
+            self, "Open Initial Extrinsics LiDAR Points", "", "CSV Files (*.csv)"
         )
         if file_path:
             self.set_points_path(file_path)
+
+    def load_image_points_dialog(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Open Initial Extrinsics Image Points", "", "CSV Files (*.csv)"
+        )
+        if file_path:
+            self.set_image_points_path(file_path)
 
     def set_laz_path(self, path):
         self.laz_path = path
@@ -216,6 +250,10 @@ class MainWindow(QMainWindow):
     def set_points_path(self, path):
         self.points_path = path
         self.points_path_label.setText(path)
+
+    def set_image_points_path(self, path):
+        self.image_points_path = path
+        self.image_points_path_label.setText(path)
 
     def update_proceed_button_state(self):
         self.proceed_button.setEnabled(
@@ -238,6 +276,31 @@ class MainWindow(QMainWindow):
                 self.load_status_label.setText(f"Error loading initial extrinsics points: {e}")
                 return
             print(f"Highlighting {len(self.marked_points)} LiDAR points from: {self.points_path}")
+
+        self.marked_image_points = None
+        if self.image_points_path:
+            if self.marked_points is None:
+                self.load_status_label.setText(
+                    "Error: the initial extrinsics image points need their matching LiDAR points"
+                )
+                return
+            try:
+                self.marked_image_points = load_marked_image_points(self.image_points_path)
+            except Exception as e:
+                self.load_status_label.setText(
+                    f"Error loading initial extrinsics image points: {e}"
+                )
+                return
+            if len(self.marked_image_points) != len(self.marked_points):
+                self.load_status_label.setText(
+                    f"Error: {len(self.marked_image_points)} initial extrinsics image points but "
+                    f"{len(self.marked_points)} LiDAR points; they pair up row by row"
+                )
+                return
+            print(
+                f"Adding {len(self.marked_image_points)} correspondences from: "
+                f"{self.image_points_path}"
+            )
 
         self.image_msg = data["image_msg"]
         self.pointcloud_msg = data["pointcloud_msg"]
@@ -378,6 +441,7 @@ class MainWindow(QMainWindow):
             ros_utils,
             initial_transform,
             marked_points_xyz=self.marked_points,
+            marked_image_points=self.marked_image_points,
         )
         self.calibration_widget.calibration_completed.connect(self.on_calibration_completed)
         self.stacked_widget.setCurrentIndex(self.stacked_widget.addWidget(self.calibration_widget))
@@ -422,7 +486,11 @@ class MainWindow(QMainWindow):
         elif lower.endswith(BUNDLE_EXTENSIONS):
             self.set_bundle_path(path)
         elif lower.endswith(POINTS_EXTENSIONS):
-            self.set_points_path(path)
+            # Image points have X and Y column names; LiDAR points are x, y, z rows
+            if is_image_points_csv(path):
+                self.set_image_points_path(path)
+            else:
+                self.set_points_path(path)
         else:
             self.load_status_label.setText(f"Error: Unrecognised file type: {path}")
 

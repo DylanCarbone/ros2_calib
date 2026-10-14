@@ -34,6 +34,7 @@ elsewhere in this app (see ros_utils.py) so it can flow through the existing
 LiDAR2Cam calibration widget unchanged.
 """
 
+import csv
 import os
 
 import cv2
@@ -58,12 +59,15 @@ def _load_pointcloud(path: str) -> ros_utils.PointCloud2:
     y = np.asarray(las.y, dtype=np.float32)
     z = np.asarray(las.z, dtype=np.float32)
     intensity = np.asarray(getattr(las, "intensity", np.zeros_like(x)), dtype=np.float32)
+    # Colour recorded by the scanner, when the file has it
+    has_color = {"red", "green", "blue"} <= set(las.point_format.dimension_names)
 
     num_points = x.shape[0]
-    structured = np.zeros(
-        num_points,
-        dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("intensity", "<f4")],
-    )
+    dtype = [("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("intensity", "<f4")]
+    if has_color:
+        # One byte per channel, padded to a 4-byte point step
+        dtype += [("red", "u1"), ("green", "u1"), ("blue", "u1"), ("_pad", "u1")]
+    structured = np.zeros(num_points, dtype=dtype)
     structured["x"] = x
     structured["y"] = y
     structured["z"] = z
@@ -77,15 +81,28 @@ def _load_pointcloud(path: str) -> ros_utils.PointCloud2:
             name="intensity", offset=12, datatype=ros_utils.PointField.FLOAT32, count=1
         ),
     ]
+    if has_color:
+        colors = np.column_stack([las.red, las.green, las.blue]).astype(np.uint32)
+        # LAS colours are usually 16-bit; scaled to 8-bit when they use the 16-bit range
+        if colors.max() > 255:
+            colors = colors >> 8
+        for offset, name in enumerate(("red", "green", "blue")):
+            structured[name] = colors[:, offset].astype(np.uint8)
+            fields.append(
+                ros_utils.PointField(
+                    name=name, offset=16 + offset, datatype=ros_utils.PointField.UINT8, count=1
+                )
+            )
 
+    point_step = structured.dtype.itemsize
     return ros_utils.PointCloud2(
         header=ros_utils.Header(frame_id=LIDAR_FRAME_ID),
         height=1,
         width=num_points,
         fields=fields,
         is_bigendian=False,
-        point_step=16,
-        row_step=16 * num_points,
+        point_step=point_step,
+        row_step=point_step * num_points,
         data=structured.tobytes(),
         is_dense=True,
     )
@@ -125,21 +142,65 @@ def load_marked_points(path: str) -> np.ndarray:
     return points
 
 
+def _read_csv_rows(path: str) -> list:
+    with open(path, newline="", encoding="utf-8-sig", errors="replace") as f:
+        return [row for row in csv.reader(f) if any(cell.strip() for cell in row)]
+
+
+def _xy_columns(header: list):
+    """Indices of the columns named X and Y (any case), or None if the row has no such names."""
+    names = [cell.strip().upper() for cell in header]
+    if "X" in names and "Y" in names:
+        return names.index("X"), names.index("Y")
+    return None
+
+
+def is_image_points_csv(path: str) -> bool:
+    """Whether a CSV holds image points: its first row names X and Y columns."""
+    try:
+        rows = _read_csv_rows(path)
+    except OSError:
+        return False
+    return bool(rows) and _xy_columns(rows[0]) is not None
+
+
+def load_marked_image_points(path: str) -> np.ndarray:
+    """
+    Load 2D image points (N x 2, pixels on the loaded image) from a CSV with columns named X
+    and Y, as saved by ImageJ/Fiji's Measure, such as the image points the initial extrinsics
+    were solved from. Without such a header, x and y are read from the first two columns.
+    Rows keep their order, so they pair with the rows of the matching LiDAR points.
+    """
+    name = os.path.basename(path)
+    rows = _read_csv_rows(path)
+    columns = _xy_columns(rows[0]) if rows else None
+    if columns is None:
+        columns = (0, 1)
+    else:
+        rows = rows[1:]
+    try:
+        points = np.array([[float(row[c]) for c in columns] for row in rows], dtype=np.float64)
+    except (ValueError, IndexError):
+        raise ValueError(f"'{name}' needs X and Y columns of numbers on every row") from None
+    if len(points) == 0:
+        raise ValueError(f"'{name}' holds no X, Y image points")
+    if not np.all(np.isfinite(points)):
+        raise ValueError(f"'{name}' has an image point that isn't a number")
+    return points
+
+
 def find_missing_bundle_keys(bundle_path: str) -> list:
     """Return a list of required npz keys that are missing from bundle_path."""
     with np.load(bundle_path) as npz:
         return [key for key in REQUIRED_BUNDLE_KEYS if key not in npz]
 
 
-def _load_camera_info(
-    bundle_path: str, fallback_width: int, fallback_height: int
-) -> tuple:
+def _load_camera_info(bundle_path: str, fallback_width: int, fallback_height: int) -> tuple:
     """Returns (CameraInfo, extrinsics_matrix, intrinsics_matrix, distortion_matrix)."""
     missing = find_missing_bundle_keys(bundle_path)
     if missing:
         raise ValueError(
-            f"'{os.path.basename(bundle_path)}' is missing required array(s): "
-            f"{', '.join(missing)}"
+            f"'{os.path.basename(bundle_path)}' is missing required array(s): {', '.join(missing)}"
         )
 
     with np.load(bundle_path) as npz:

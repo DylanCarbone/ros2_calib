@@ -40,6 +40,12 @@ def parse_args(argv):
         help="Optional .csv of the 3D LiDAR points (x, y, z per row) the initial extrinsics were "
         "solved from, highlighted in the calibration view",
     )
+    parser.add_argument(
+        "--image-points",
+        help="Optional .csv of the image points (X and Y columns, pixels on --image) the initial "
+        "extrinsics were solved from, in the same order as --points; each pair is added as a "
+        "correspondence",
+    )
     return parser.parse_known_args(argv)[0]
 
 
@@ -51,6 +57,7 @@ def main():
         image_path=args.image,
         bundle_path=args.bundle,
         points_path=args.points,
+        image_points_path=args.image_points,
     )
     window.show()
     sys.exit(app.exec())
